@@ -1,0 +1,6 @@
+
+full walkthrough (theory, archetecture, training)
+- https://medium.com/@sayedebad.777/mastering-transformer-detailed-insights-into-each-block-and-their-math-4221c6ee0076
+- https://medium.com/@sayedebad.777/building-a-transformer-from-scratch-a-step-by-step-guide-a3df0aeb7c9a
+- https://medium.com/@sayedebad.777/training-a-transformer-model-from-scratch-25bb270f5888
+
