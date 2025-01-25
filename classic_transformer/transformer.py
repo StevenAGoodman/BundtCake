@@ -2,7 +2,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+"""
+NOTES:
+
+Difference between encoder and decoder inputs:
+    - the encoder input is 
+"""
+
 class Embedding(nn.Module):
+    """
+    Represting input tokens as d_model-length learnable vectors
+    """
     def __init__(self, d_model: int, vocab_size: int):
         super().__init__()
         self.d_model = d_model
@@ -13,6 +23,10 @@ class Embedding(nn.Module):
         return self.embedding(x) * np.sqrt(self.d_model)
 
 class PosEncoding(nn.Module):
+    """
+    Positional encoding to allow transfomrer to learn trends about relative position of tokens
+        - fancy equation to calculate positional encoding
+    """
     def __init__(self, d_model: int, seq: int, dropout: float) -> None:
         super().__init__()
         self.d_model = d_model
@@ -71,7 +85,7 @@ class ResidualConn(nn.Module):
         - intakes x and desired layer sublayer
         - runs through normalizing
         - apply sublayer
-        -
+        - add original x and sublayer output
     """
     def __init__(self, features: int, dropout: float) -> None:
         super().__init__()
@@ -79,6 +93,7 @@ class ResidualConn(nn.Module):
         self.norm = LayerNorm(features)
 
     def forward(self, x, sublayer):
+        # sublayer is a function with ONLY 1 input ALWAYS as it calls on another function within
         return x + self.dropout(sublayer(self.norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
@@ -134,5 +149,143 @@ class MultiHeadAttentionBlock(nn.Module):
         x = x.transpose(1,2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
         return self.w_o(x)
 
+# perhaps you could make it simpler by combining this and encoder class
+class EncoderBlock(nn.Module):
+    """
+    Putting together the mechanisms that form a single encoder block:
+        - multihead attention with residual connection (one x skips and adds)
+        - feed forward block with residual connection
+    """
+    def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float) -> None:
+        super().__init__()
+        self.residual_conn_1 = ResidualConn(features, dropout)
+        self.self_attention_block = self_attention_block
+        self.residual_conn_2 = ResidualConn(features, dropout)
+        self.feed_forward_block = feed_forward_block
 
+    def forward(self, x, src_mask):
+        x = self.residual_conn_1(x, lambda x: self.self_attention_block(x, x, x, src_mask))
+        x = self.residual_conn_2(x, self.feed_forward_block)
+        return x
+    
+class Encoder(nn.Module):
+    """
+    A bunch of encoder blocks stuck together
+    """
+    def __init__(self, features: int, layers: nn.Module) -> None:
+        super().__init__()
+        self.layers = layers
+        self.norm = LayerNorm(features)
 
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x) 
+
+class DecoderBlock(nn.Module):
+    """
+    Putting together the mechansims that form a single decoder block"
+        - intakes x an performs self attention with residual skipping and adding
+        - multihead attention with key and value matrices from the output of the encoder and queries as x
+        - feed forward to put it all together and learn some nonlinear relationships
+    """
+    def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, cross_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float) -> None:
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.cross_attention_block = cross_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_conns = nn.ModuleList([ResidualConn(features, dropout) for _ in range(3)])
+
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        # x = decoder input
+        x = self.residual_conns[0](x, lambda x: self.self_attention_block(x,x,x,tgt_mask))
+        x = self.residual_conns[0](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
+        x = self.residual_conns[0](x, self.feed_forward_block)
+        return x
+
+class Decoder(nn.Module):
+    """
+    A bunch of decoder blocks stuck together
+    """
+    def __init__(self, features: int, layers: nn.ModuleList) -> None:
+        super().__init__()
+        self.layers = layers
+        self.norm = LayerNorm(features)
+    
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, encoder_output, src_mask, tgt_mask)
+        return self.norm(x)
+    
+class ProjectionLayer(nn.Module):
+    """
+    Super simple linear fully connected layer to map decoder outputs back to the vocab space
+    """
+    def __init__(self, d_model, vocab_size) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x) -> None:
+        return self.proj(x)
+
+class Transformer(nn.Module):
+    """Mashing it all together into set of functions on a model"""
+    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: Embedding, tgt_embed: Embedding, src_pos: PosEncoding, tgt_pos: PosEncoding, projection_layer: ProjectionLayer) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.src_pos = src_pos
+        self.tgt_pos = tgt_pos
+        self.projection_layer = projection_layer
+
+    def encode(self, src, src_mask):
+        src = self.src_embed(src)
+        src = self.src_pos(src)
+        return self.encoder(src, src_mask)
+
+    def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask:torch.Tensor):
+        tgt = self.tgt_embed(tgt)
+        tgt = self.tgt_pos(tgt)
+        return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+
+    def project(self, x):
+        return self.projection_layer(x)
+
+def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_dim: int, tgt_seq_dim: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
+    """Build that thing"""
+
+    src_embed = Embedding(d_model, src_vocab_size)
+    tgt_embed = Embedding(d_model, tgt_vocab_size)
+    src_pos = PosEncoding(d_model, src_seq_dim, dropout)
+    tgt_pos = PosEncoding(d_model, tgt_seq_dim, dropout)
+
+    encoder_blocks = []
+    for _ in range(N):
+        encoder_blocks.append(EncoderBlock(d_model,
+            MultiHeadAttentionBlock(d_model, h, dropout),
+            FeedForwardBlock(d_model, d_ff, dropout), dropout
+        ))
+
+    decoder_blocks = []
+    for _ in range(N):
+        decoder_blocks.append(DecoderBlock(d_model,
+            MultiHeadAttentionBlock(d_model, h, dropout),
+            MultiHeadAttentionBlock(d_model, h, dropout),
+            FeedForwardBlock(d_model, d_ff, dropout), dropout
+        ))
+    
+    encoder = Encoder(d_model, nn.ModuleList(encoder_blocks))
+    decoder = Decoder(d_model, nn.ModuleList(decoder_blocks))
+
+    projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
+
+    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer)
+
+    # intialize params with some fancy pytorch jazz
+    for p in transformer.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p) 
+
+    return transformer

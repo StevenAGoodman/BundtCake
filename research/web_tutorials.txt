@@ -1,3 +1,5 @@
+initial reads:
+- https://medium.com/@bavalpreetsinghh/transformer-from-scratch-using-pytorch-28a5d1b2e033
 
 full walkthrough (theory, archetecture, training)
 - https://medium.com/@sayedebad.777/mastering-transformer-detailed-insights-into-each-block-and-their-math-4221c6ee0076
