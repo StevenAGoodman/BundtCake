@@ -1,82 +1,50 @@
-import numpy as np
+
+import math
+import inspect
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
 """
 NOTES:
+- no decoders/encoders; only generation
 
-Difference between encoder and decoder inputs:
-    - the encoder input is 
+Adapted from `https://github.com/karpathy/nanoGPT`
 """
-
-class Embedding(nn.Module):
-    """
-    Represting input tokens as d_model-length learnable vectors
-    """
-    def __init__(self, d_model: int, vocab_size: int):
-        super().__init__()
-        self.d_model = d_model
-        self.vocab_size = vocab_size
-        self.embedding = nn.Embedding(vocab_size, d_model)
-
-    def forward(self, x):
-        return self.embedding(x) * np.sqrt(self.d_model)
-
-class PosEncoding(nn.Module):
-    """
-    Positional encoding to allow transfomrer to learn trends about relative position of tokens
-        - fancy equation to calculate positional encoding
-    """
-    def __init__(self, d_model: int, seq: int, dropout: float) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.seq = seq
-        self.dropout = nn.Dropout(dropout)
-
-        pe = torch.zeros(seq, d_model)
-        position = torch.arange(0, seq, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False)
-        return self.dropout(x)
 
 class LayerNorm(nn.Module):
     """
     Normalizing a batch of multiple seqs
         - fancy equation relating mean, std and learnable params to normalized vectors
     """
-    def __init__(self, features: int, eps: float=10**-6) -> None:
+    def __init__(self, ndim, bias):
         super().__init__()
-        self.eps = eps
-        self.alpha = nn.Parameter(torch.ones(features))
-        self.bias = nn.Parameter(torch.zeros(features))
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class FeedForwardBlock(nn.Module):
+class FeedForwardNet(nn.Module):
     """
     Big neural net in the middle to learn complex, nonlinear trends in the abstract embeddings. Kinda the core where encoder and decoder meet?
         - fully connected layer to (usually) higher dim d_ff
         - relu for compression
         - fully connected layer back to original dims
     """
-    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
+    def __init__(self, config):
         super().__init__()
-        self.linear_1 = nn.Linear(d_model, d_ff)
-        self.dropout = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(d_ff, d_model)
-    
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
     def forward(self, x):
-        return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 class ResidualConn(nn.Module):
     """
@@ -96,9 +64,9 @@ class ResidualConn(nn.Module):
         # sublayer is a function with ONLY 1 input ALWAYS as it calls on another function within
         return x + self.dropout(sublayer(self.norm(x)))
 
-class MultiHeadAttentionBlock(nn.Module):
+class Attention(nn.Module):
     """
-    Better self attention where tokens are split into h heads allowing for deeper weights to be learned
+    Multihead self attention where tokens are split into h heads allowing for deeper weights to be learned
         - intake query, key, and value matrices 
         - multiply with corresponding learned weight matrices (w_q, w_k, w_v)
         - split into h heads along the d_model dim (not seq)
@@ -106,152 +74,231 @@ class MultiHeadAttentionBlock(nn.Module):
         - concat the individual head values
         - multiply by last weight matrix w_o 
     """
-    def __init__(self, d_model: int, h: int, dropout: float) -> None:
+    def __init__(self, config):
         super().__init__()
-        self.d_model = d_model
-        self.h = h
-        assert d_model % h == 0, "d_model not divisable by h"
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
 
-        self.d_k = d_model // h
-        # a bunch of linear models that represent weight matrices, i think?
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-        self.w_k = nn.Linear(d_model, d_model, bias=False)
-        self.w_v = nn.Linear(d_model, d_model, bias=False)
-        self.w_o = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-    @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
-        d_k = query.shape[-1]
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        attention_scores = (query @ key.transpose(-2, -1)) / np.sqrt(d_k)
-        if mask is not None: attention_scores.masked_fill_(mask == 0, -1e9)
-        attention_scores = attention_scores.softmax(dim=-1)
-        if dropout is not None: attention_scores = dropout(attention_scores)
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-        return (attention_scores @ value), attention_scores
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
-    def forward(self, q, k, v, mask):
-        # multiply weights through fully connected layer thing
-        query = self.w_q(q)
-        key = self.w_k(k)
-        value = self.w_v(v)
-
-        # change dimensions and dim order for matrices
-        query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1,2)
-        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1,2)
-        value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1,2)
-
-        # ACTUAL ATTENTION CALCULATION 
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
-        
-        # return to og shape and concat
-        x = x.transpose(1,2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
-        return self.w_o(x)
-
-# perhaps you could make it simpler by combining this and encoder class
-class EncoderBlock(nn.Module):
-    """
-    Putting together the mechanisms that form a single encoder block:
-        - multihead attention with residual connection (one x skips and adds)
-        - feed forward block with residual connection
-    """
-    def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float) -> None:
+class Block(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.residual_conn_1 = ResidualConn(features, dropout)
-        self.self_attention_block = self_attention_block
-        self.residual_conn_2 = ResidualConn(features, dropout)
-        self.feed_forward_block = feed_forward_block
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = Attention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ff = FeedForwardNet(config)
 
-    def forward(self, x, src_mask):
-        x = self.residual_conn_1(x, lambda x: self.self_attention_block(x, x, x, src_mask))
-        x = self.residual_conn_2(x, self.feed_forward_block)
-        return x
-    
-class Encoder(nn.Module):
-    """
-    A bunch of encoder blocks stuck together
-    """
-    def __init__(self, features: int, layers: nn.Module) -> None:
-        super().__init__()
-        self.layers = layers
-        self.norm = LayerNorm(features)
-
-    def forward(self, x, mask):
-        for layer in self.layers:
-            x = layer(x, mask)
-        return self.norm(x) 
-
-class DecoderBlock(nn.Module):
-    """
-    Putting together the mechansims that form a single decoder block"
-        - intakes x an performs self attention with residual skipping and adding
-        - multihead attention with key and value matrices from the output of the encoder and queries as x
-        - feed forward to put it all together and learn some nonlinear relationships
-    """
-    def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, cross_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float) -> None:
-        super().__init__()
-        self.self_attention_block = self_attention_block
-        self.cross_attention_block = cross_attention_block
-        self.feed_forward_block = feed_forward_block
-        self.residual_conns = nn.ModuleList([ResidualConn(features, dropout) for _ in range(3)])
-
-    def forward(self, x, encoder_output, src_mask, tgt_mask):
-        # x = decoder input
-        x = self.residual_conns[0](x, lambda x: self.self_attention_block(x,x,x,tgt_mask))
-        x = self.residual_conns[0](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
-        x = self.residual_conns[0](x, self.feed_forward_block)
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.ff(self.ln_2(x))
         return x
 
-class Decoder(nn.Module):
-    """
-    A bunch of decoder blocks stuck together
-    """
-    def __init__(self, features: int, layers: nn.ModuleList) -> None:
-        super().__init__()
-        self.layers = layers
-        self.norm = LayerNorm(features)
-    
-    def forward(self, x, encoder_output, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, encoder_output, src_mask, tgt_mask)
-        return self.norm(x)
-    
-class ProjectionLayer(nn.Module):
-    """
-    Super simple linear fully connected layer to map decoder outputs back to the vocab space
-    """
-    def __init__(self, d_model, vocab_size) -> None:
-        super().__init__()
-        self.proj = nn.Linear(d_model, vocab_size)
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-    def forward(self, x) -> None:
-        return self.proj(x)
 
 class Transformer(nn.Module):
     """Mashing it all together into set of functions on a model"""
-    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: Embedding, tgt_embed: Embedding, src_pos: PosEncoding, tgt_pos: PosEncoding, projection_layer: ProjectionLayer) -> None:
+    def __init__(self, config):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.src_pos = src_pos
-        self.tgt_pos = tgt_pos
-        self.projection_layer = projection_layer
+        self.config = config
 
-    def encode(self, src, src_mask):
-        src = self.src_embed(src)
-        src = self.src_pos(src)
-        return self.encoder(src, src_mask)
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd), # token embed
+            wpe = nn.Embedding(config.block_size, config.n_embd), # positional embed
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # the actual repeated blocks of the transformer
+            ln_f = LayerNorm(config.n_embd, bias=config.bias), # projection layer
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-    def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask:torch.Tensor):
-        tgt = self.tgt_embed(tgt)
-        tgt = self.tgt_pos(tgt)
-        return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+        # init all weights
+        self.apply(self._init_weights)
+        
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-    def project(self, x):
-        return self.projection_layer(x)
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb) # add embeds to create input vectors
+        for block in self.transformer.h: # send through all the repeated transformer blocks
+            x = block(x)
+        x = self.transformer.ln_f(x) # projection back to vocab space
+
+        if targets is not None:
+            # if given targets, we also want the loss
+            logits = self.lm_head(x)
+            loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt) # per second
+        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+
+
+
+
 
 def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_dim: int, tgt_seq_dim: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
     """Build that thing"""
