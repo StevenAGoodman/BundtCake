@@ -2,3 +2,8 @@
 ./*/__pycache__
 ./classic_transformer/opus_books_weights
 ./classic_transformer/
+
+./data/GCF_000195955.2_ASM19595v2_genomic.gtf
+./data/sample_*.gff
+./data/sample_*.txt
+./data/sample_*.json
