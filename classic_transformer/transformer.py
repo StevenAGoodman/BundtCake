@@ -1,4 +1,3 @@
-
 import math
 import inspect
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return nn.functional.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class FeedForwardNet(nn.Module):
     """
@@ -112,7 +111,7 @@ class Attention(nn.Module):
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            att = nn.functional.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -155,7 +154,7 @@ class Transformer(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd), # token embed
             wpe = nn.Embedding(config.block_size, config.n_embd), # positional embed
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # the actual repeated blocks of the transformer
+            blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # the actual repeated blocks of the transformer
             ln_f = LayerNorm(config.n_embd, bias=config.bias), # projection layer
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -200,7 +199,7 @@ class Transformer(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb) # add embeds to create input vectors
-        for block in self.transformer.h: # send through all the repeated transformer blocks
+        for block in self.transformer.blocks: # send through all the repeated transformer blocks
             x = block(x)
         x = self.transformer.ln_f(x) # projection back to vocab space
 
@@ -222,7 +221,7 @@ class Transformer(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
+        for block in self.transformer.blocks:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
@@ -287,52 +286,10 @@ class Transformer(nn.Module):
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            probs = nn.functional.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-
-
-
-
-
-def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_dim: int, tgt_seq_dim: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
-    """Build that thing"""
-
-    src_embed = Embedding(d_model, src_vocab_size)
-    tgt_embed = Embedding(d_model, tgt_vocab_size)
-    src_pos = PosEncoding(d_model, src_seq_dim, dropout)
-    tgt_pos = PosEncoding(d_model, tgt_seq_dim, dropout)
-
-    encoder_blocks = []
-    for _ in range(N):
-        encoder_blocks.append(EncoderBlock(d_model,
-            MultiHeadAttentionBlock(d_model, h, dropout),
-            FeedForwardBlock(d_model, d_ff, dropout), dropout
-        ))
-
-    decoder_blocks = []
-    for _ in range(N):
-        decoder_blocks.append(DecoderBlock(d_model,
-            MultiHeadAttentionBlock(d_model, h, dropout),
-            MultiHeadAttentionBlock(d_model, h, dropout),
-            FeedForwardBlock(d_model, d_ff, dropout), dropout
-        ))
-    
-    encoder = Encoder(d_model, nn.ModuleList(encoder_blocks))
-    decoder = Decoder(d_model, nn.ModuleList(decoder_blocks))
-
-    projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
-
-    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer)
-
-    # intialize params with some fancy pytorch jazz
-    for p in transformer.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p) 
-
-    return transformer
