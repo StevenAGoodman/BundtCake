@@ -3,11 +3,16 @@ Main purpose: load in data set from external storage, tokenize it, pad it, etc
 """
 
 from datasets import load_dataset
+import tiktoken
+
+enc = tiktoken.get_encoding("gpt2")
 
 def init_dataset_files(name):
     dataset = load_dataset("Stegvean/CakeGenomes")
     
     # split dataset
+    split_dataset = dataset["train"].train_test_split(test_size=0.1, shuffle=True)
+    split_dataset["val"] = split_dataset.pop('test') 
 
     # tokenize the dataset
     def process(example):
