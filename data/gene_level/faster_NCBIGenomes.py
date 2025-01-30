@@ -7,7 +7,6 @@ import ftplib
 from concurrent.futures import ThreadPoolExecutor
 import os
 
-
 start_idx = 0
 global last_idx
 last_idx = start_idx
@@ -18,25 +17,14 @@ genome_id_df = pd.read_csv(genome_id_file, sep="\t")
 genome_id_df = genome_id_df[genome_id_df["Assembly Accession"].str.startswith("GCF")]
 accession_list = genome_id_df["Assembly Accession"].tolist()
 
-# Output files
-nt_seq_file = "./nt_seqs.txt"
-nt_f = open(nt_seq_file, "a")
-nt_f.write("################ SESSION START ################\n")
-
-gene_seq_file = "./gene_seqs.txt"
-gene_f = open(gene_seq_file, "a")
-gene_f.write("################ SESSION START ################\n")
-
-# info files
-gene_info_f = "./all.gene_info"
-gene_info_f = open(gene_info_f, "r")
-
-genetogo = "./gene2go" 
-genetogo = open(genetogo, "r")
+# Output file
+genome_seq_file = "./genome_seqs.txt"
+f = open(genome_seq_file, "a")
+f.write("################ SESSION START ################\n")
 
 # Pre-compiled regex
-cds_file_regex = re.compile("^.+_cds_from_genomic\.fna\.gz$")
-subdir_version_regex = re.compile("^GCF_\d+\.(\d)_.+$")
+feature_table_regex = re.compile("^.+_feature_table\.txt\.gz$")
+subdir_version_regex = re.compile("^GCF_\\d+\\.(\\d)_.+$")
 
 # Get the latest version of the directory
 def get_latest_version(array, version):
@@ -45,12 +33,6 @@ def get_latest_version(array, version):
     if len(l) == 1:
         return l[0]
     return l[max(range(len(l)), key=lambda x: int(subdir_version_regex.search(l[x]).group(1)))]
-
-def get_associated_go(gene_id):
-    for line in gene_info_f:
-        if gene_id in line:
-            return line.split("\t")[5]
-    return None
 
 # Fetch genes from FTP
 def fetch_genes(accession):
@@ -67,48 +49,33 @@ def fetch_genes(accession):
         ftp.cwd(subdir)
 
         files = ftp.nlst()
-        file_name = list(filter(cds_file_regex.match, files))[0]
+        file_name = list(filter(feature_table_regex.match, files))[0]
         url = f"https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/{dir_path}/{subdir}/{file_name}"
 
         with urllib.request.urlopen(url) as response:
             content = gzip.decompress(response.read())
-        content: list[str] = content.decode("utf-8").split("\n")
-
-        gene_ids = []
-        nt_seq = ""
-        for line in content:    
-            # gene ids
-            if line.startswith(">"):
-                gene_id = re.search("GeneID:(\\d+)", line)
-                if not gene_id:
-                    gene_id = re.search("\\[protein_id=([A-Z]+_\\d+\\.\\d)\\]", line)
-                if gene_id:
-                    gene_ids.append(gene_id.group(1))
-                nt_seq += " " # split genes by whitespace
-            # nt seq
-            else:
-                nt_seq += line
- 
-        return gene_ids, nt_seq
+        
+        content = content[content.find(b"\nNC_")+1:-4]
+        genome_df = pd.read_csv(BytesIO(content), sep="\t")
+        gene_ids = genome_df[genome_df["# feature"] == "CDS"]["product_accession"].dropna().tolist()
+        return gene_ids
 
     except Exception as e:
         print(f"Error fetching genes for {accession}: {e}")
-
-        return [], ""
+        return []
     finally:
         ftp.quit()
 
 # Write results
 def process_accession(accession):
-    gene_ids, nt_seq = fetch_genes(accession)
-    gene_f.write(f"{accession}: {' '.join(gene_ids)}\n" if gene_ids else "")
-    nt_f.write(f"{accession}: {nt_seq}\n" if nt_seq else "")
+    gene_ids = fetch_genes(accession)
+    f.write(f"{accession}: {' '.join(gene_ids)}\n" if gene_ids else "")
     print("Last finished index: ", accession_list.index(accession)) 
 
 
 # Parallel processing
 def main():
-    # for accession in accession_list:
+    # for accession in accession_list[start_idx:]:
     #     process_accession(accession)
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         results = executor.map(process_accession, accession_list)
