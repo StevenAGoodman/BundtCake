@@ -59,10 +59,12 @@ if __name__ == "__main__":
     )
     print(tokenized_dataset)
 
+    os.mkdir("data")
+
     # write to mem map
     for split, dset in tokenized_dataset.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
-        filename = os.path.join(os.path.dirname(__file__), 'data', f'{split}.bin')
+        filename = os.path.join(os.path.dirname(__file__), "data", f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
         total_batches = min(1024, len(dset))
