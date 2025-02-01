@@ -1,4 +1,6 @@
 tokenizer_*.json
 foo.py
-bar.py
 __pycache__
+tokenizer/tokenizer_data_train.json
+data
+reduced_train_correct.txt

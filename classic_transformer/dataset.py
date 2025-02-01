@@ -3,39 +3,69 @@ Main purpose: load in data set from external storage, tokenize it, pad it, etc
 """
 
 from datasets import load_dataset
-import tiktoken
+from multiprocessing import Pool
+import numpy as np
+import os
+from tqdm import tqdm
+import json
 
-enc = tiktoken.get_encoding("gpt2")
+dataset = load_dataset("Stegvean/CakeGenomes")["reduced"]
 
-def init_dataset_files(name):
-    dataset = load_dataset("Stegvean/CakeGenomes")
-    
-    # split dataset
-    split_dataset = dataset["train"].train_test_split(test_size=0.1, shuffle=True)
-    split_dataset["val"] = split_dataset.pop('test') 
+# split dataset
+split_dataset = dataset.train_test_split(test_size=0.03, shuffle=True)
+split_dataset["val"] = split_dataset.pop('test') 
+print(split_dataset)
+print("training size:", len(split_dataset["train"]))
+print("validation size:", len(split_dataset["val"]))
 
-    # tokenize the dataset
-    def process(example):
-        ids = enc.encode_ordinary(example['text']) # encode_ordinary ignores any special tokens
-        ids.append(enc.eot_token) # add the end of text token, e.g. 50256 for gpt2 bpe
-        # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
-        out = {'ids': ids, 'len': len(ids)}
-        return out
+# seq lengths
+get_len = lambda x: len(x.split(" "))
+lens = list(map(get_len, dataset["text"]))
+max_len = max(lens)
 
-    tokenized = split_dataset.map(
-        process,
-        remove_columns=['text'],
-        desc="tokenizing the splits",
-        num_proc=num_proc,
+# start, end, and padding tokens
+reduced_vocabulary = ["[PAD]", "[EOS]", "[SOS]"]
+vocab_info = json.load(open("./tokenizer/tokenizer_data_train.json"))
+reduced_vocabulary.extend(vocab_info["reduced_vocab"])
+n = len(reduced_vocabulary)
+
+id_to_int = { id:i for i,id in enumerate(reduced_vocabulary)}
+int_to_id = { i:id for i,id in id_to_int.items()}
+encode = lambda id_list: [id_to_int[id] for id in id_list]
+decode = lambda int_list: [int_to_id[i] for i in int_list]
+
+# padding and special tokens
+def process(example):
+    id_str = example#["text"]
+    char_arr = ["[SOS]"]
+    char_arr.extend(id_str.split(" "))
+    char_arr.append("[EOS]")
+    char_arr.extend(["[PAD]"] * (max_len - len(char_arr)))
+    tokenized = encode(char_arr)
+    return tokenized
+
+def process(example):
+    char_arr = ["[SOS]"] + example["text"].split(" ") + ["[EOS]"]
+    char_arr += ["[PAD]"] * (max_len - len(char_arr))
+    tokenized = encode(char_arr)
+    return {'ids': tokenized, 'len': len(tokenized)}
+
+if __name__ == "__main__":
+    tokenized_dataset = split_dataset.map(
+        process, 
+        remove_columns=['text'], 
+        num_proc=os.cpu_count(),  # Use all available CPU cores
+        desc="Tokenizing dataset"
     )
+    print(tokenized_dataset)
 
-    # concatenate all the ids in each dataset into one large file we can use for training
-    for split, dset in tokenized.items():
+    # write to mem map
+    for split, dset in tokenized_dataset.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
-        filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+        filename = os.path.join(os.path.dirname(__file__), 'data', f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = 1024
+        total_batches = min(1024, len(dset))
 
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):

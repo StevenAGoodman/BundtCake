@@ -3,3 +3,6 @@ gene_seqs.txt
 gene2go
 nt_seqs.txt
 gene_go_mapping.json
+gene_seqs
+nt_seqs
+reduced_train.txt
