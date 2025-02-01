@@ -6,9 +6,9 @@ import re
 import ftplib
 from concurrent.futures import ThreadPoolExecutor
 import os
+import json
 
-
-start_idx = 13950
+start_idx = 0
 global last_idx
 last_idx = start_idx
 
@@ -29,12 +29,10 @@ gene_f.write("################ SESSION START ################\n")
 
 # info files
 gene_info_f = "./all.gene_info"
-gene_info_df = pd.read_csv(gene_info_f, sep="\t", usecols=["GeneID", "Symbol"])
-gene_info_df["GeneID"] = gene_info_df['GeneID'].astype(str) 
-id2sym = pd.Series(gene_info_df.Symbol.values, index=gene_info_df.GeneID).to_dict()
+gene_info_f = open(gene_info_f, "r")
 
-# genetogo = "./gene2go" 
-# genetogo = open(genetogo, "r")
+genetogof = "./gene_go_mapping.json" 
+genetogof = json.load(open(genetogof, "r"))
 
 # Pre-compiled regex
 cds_file_regex = re.compile("^.+_cds_from_genomic\.fna\.gz$")
@@ -49,13 +47,10 @@ def get_latest_version(array, version):
     return l[max(range(len(l)), key=lambda x: int(subdir_version_regex.search(l[x]).group(1)))]
 
 def get_associated_go(gene_id):
-    for line in gene_info_f:
-        if gene_id in line:
-            return line.split("\t")[5]
-    return None
-
-def get_gene_symbol(gene_id):
-    return id2sym.get(gene_id, None)
+    try:
+        return genetogof[gene_id]
+    except KeyError:
+        return None
 
 # Fetch genes from FTP
 def fetch_genes(accession):
@@ -79,60 +74,60 @@ def fetch_genes(accession):
             content = gzip.decompress(response.read())
         content: list[str] = content.decode("utf-8").split("\n")
 
+        genome_len = 0
         gene_ids = []
         nt_seq = ""
-        missed_gene = 0
+        void_gene = False
         for line in content:    
             # gene ids
             if line.startswith(">"):
-                symbol = re.search("\\[gene=([a-zA-Z]+)\\] \\[", line)
-                if symbol:
-                    gene_ids.append(symbol.group(1))
-                    nt_seq += " " # split genes by whitespace
+                genome_len += 1
+                if void_gene:
+                    void_gene = False
+                print("a", genome_len)
+                    
+                gene_id = re.search("GeneID:(\\d+)", line)
+                # if not gene_id:
+                #     gene_id = re.search("\\[protein_id=([A-Z]+_\\d+\\.\\d)\\]", line)
+                if gene_id:
+                    print("\tb", gene_id.group(1))
+                    go_terms = get_associated_go(gene_id.group(1))
+                    if go_terms:
+                        print("\t\tc", go_terms)
+                        gene_ids.append(':'.join(go_terms))
+                        nt_seq += " " # split genes by whitespace
                 else:
-                    gene_id = re.search("GeneID:(\\d+)", line)
-                    # if not gene_id:
-                    #     gene_id = re.search("\\[protein_id=([A-Z]+_\\d+\\.\\d)\\]", line)
-                    if gene_id:
-                        symbol = get_gene_symbol(gene_id.group(1))
-                        if symbol: 
-                            gene_ids.append(symbol) 
-                            nt_seq += " " # split genes by whitespace
-                        else: 
-                            gene_id = re.search("\\[locus_tag=([a-zA-Z\\d]+_[a-zA-Z\\d]+)\\] \\[", line)
-                            if gene_id:
-                                gene_ids.append(gene_id.group(1))
-                                nt_seq += " " # split genes by whitespace
-                            else:
-                                missed_gene+=1
-        
+                    void_gene = True
             # nt seq
-            else:
+            elif not void_gene:
                 nt_seq += line
  
-        return gene_ids, nt_seq, missed_gene
+        return gene_ids, nt_seq, genome_len
 
     except Exception as e:
         print(f"Error fetching genes for {accession}: {e}")
 
-        return [], "",0
+        return [], ""
     finally:
         ftp.quit()
 
 # Write results
 def process_accession(accession):
-    gene_ids, nt_seq, missed_genes = fetch_genes(accession)
+    gene_ids, nt_seq, genome_len = fetch_genes(accession)
+    print("gene ids. hoooray?", gene_ids)
     gene_f.write(f"{accession}: {' '.join(gene_ids)}\n" if gene_ids else "")
     nt_f.write(f"{accession}: {nt_seq}\n" if nt_seq else "")
-    print("Last finished index: ", accession_list.index(accession), "Missed genes: ", missed_genes) 
+    print(f"Last finished index (genome_len: {genome_len}): ", accession_list.index(accession)) 
 
 
 # Parallel processing
 def main():
-    # for accession in accession_list[start_idx:]:
+    process_accession(accession_list[1])
+
+    # for accession in accession_list:
     #     process_accession(accession)
-    with ThreadPoolExecutor(max_workers=os.cpu_count() + 5) as executor:
-        results = executor.map(process_accession, accession_list[start_idx:])
+    # with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+    #     results = executor.map(process_accession, accession_list)
 
 if __name__ == "__main__":
     main()
